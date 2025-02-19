@@ -31,13 +31,27 @@
 // Internal definitions for Large Loader
 // The types below are mirrored in llvm COFFLargeImport.h with the COFF prefix
 
+enum LargeLoaderImportType {
+    LARGE_LOADER_IMPORT_TYPE_INVALID = 0,
+    LARGE_LOADER_IMPORT_TYPE_CODE = 1,
+    LARGE_LOADER_IMPORT_TYPE_DATA = 2,
+    LARGE_LOADER_IMPORT_TYPE_WILDCARD = 0xFF,
+};
+
 enum LargeLoaderHashAlgo {
     LARGE_LOADER_HASH_ALGO_CityHash64 = 0,
 };
 
+enum LargeLoaderImportFlags {
+    LARGE_LOADER_IMPORT_FLAGS_NONE = 0x0,
+    LARGE_LOADER_IMPORT_FLAGS_WILDCARD_LOOKUP_WIN32_EXPORT_DIRECTORY = 0x01,
+    LARGE_LOADER_IMPORT_FLAGS_SYNTHETIC = 0x02,
+};
+
 struct LargeLoaderImport {
     WORD ExportSectionIndex;
-    WORD ImportKind;
+    BYTE ImportKind;
+    BYTE ImportFlags;
     DWORD NameLen;
     DWORD NameOffset;
     DWORD Pad;
@@ -82,7 +96,6 @@ struct LargeLoaderExportSectionHeader {
     DWORD ImageFilenameLength;
 };
 
-//EXTERN_C LARGE_LOADER_API void __large_loader_register(HMODULE ImageBase, struct LargeLoaderExportSectionHeader* LargeExportSectionHeader); // NOLINT(*-reserved-identifier)
-//EXTERN_C LARGE_LOADER_API void __large_loader_unregister(HMODULE ImageBase, struct LargeLoaderExportSectionHeader* LargeExportSectionHeader); // NOLINT(*-reserved-identifier)
-
+EXTERN_C LARGE_LOADER_API void __large_loader_register(HMODULE ImageBase, struct LargeLoaderExportSectionHeader* LargeExportSectionHeader); // NOLINT(*-reserved-identifier)
+EXTERN_C LARGE_LOADER_API void __large_loader_unregister(HMODULE ImageBase); // NOLINT(*-reserved-identifier)
 EXTERN_C LARGE_LOADER_API void __large_loader_link(HMODULE ImageBase, struct LargeLoaderImportSectionHeader* LargeImportSectionHeader); // NOLINT(*-reserved-identifier)
