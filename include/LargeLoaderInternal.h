@@ -25,8 +25,10 @@
 
 #include "LargeLoader.h"
 
-#define LARGE_LOADER_VERSION_INITIAL 1
-#define CURRENT_LARGE_LOADER_VERSION LARGE_LOADER_VERSION_INITIAL
+enum COFFLargeLoaderVersion {
+    LARGE_LOADER_VERSION_INITIAL = 1,
+    LARGE_LOADER_VERSION_ARM64EC_EXPORTAS = 2,
+};
 
 // Internal definitions for Large Loader
 // The types below are mirrored in llvm COFFLargeImport.h with the COFF prefix
@@ -43,9 +45,10 @@ enum LargeLoaderHashAlgo {
 };
 
 enum LargeLoaderImportFlags {
-    LARGE_LOADER_IMPORT_FLAGS_NONE = 0x0,
-    LARGE_LOADER_IMPORT_FLAGS_WILDCARD_LOOKUP_WIN32_EXPORT_DIRECTORY = 0x01,
-    LARGE_LOADER_IMPORT_FLAGS_SYNTHETIC = 0x02,
+    LARGE_LOADER_IMPORT_FLAG_NONE = 0x0,
+    LARGE_LOADER_IMPORT_FLAG_WILDCARD_LOOKUP_WIN32_EXPORT_DIRECTORY = 0x01,
+    LARGE_LOADER_IMPORT_FLAG_SYNTHETIC = 0x02,
+    LARGE_LOADER_IMPORT_FLAG_WEAK_DATA = 0x04,
 };
 
 struct LargeLoaderImport {
@@ -67,6 +70,7 @@ struct LargeLoaderImportSectionHeader {
     DWORD ImportTableOffset;
     DWORD ImageFilenameOffset;
     DWORD ImageFilenameLength;
+    DWORD AuxiliaryAddressTableOffset;
 };
 
 struct LargeLoaderExport {
@@ -94,6 +98,7 @@ struct LargeLoaderExportSectionHeader {
     DWORD SectionHeaderRVA;
     DWORD ImageFilenameOffset;
     DWORD ImageFilenameLength;
+    DWORD AuxExportRVATableOffset;
 };
 
 EXTERN_C LARGE_LOADER_API void __large_loader_register(HMODULE ImageBase, struct LargeLoaderExportSectionHeader* LargeExportSectionHeader); // NOLINT(*-reserved-identifier)

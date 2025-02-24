@@ -8,12 +8,20 @@
     _ACRTIMP void __cdecl _assert(const char*, const char*, unsigned); // NOLINT(*-reserved-identifier)
 #endif
 
+#define CURRENT_LARGE_LOADER_VERSION LARGE_LOADER_VERSION_ARM64EC_EXPORTAS
+
 struct LargeLoaderModuleEntry
 {
     HMODULE ModuleHandle;
     struct LargeLoaderExportSectionHeader* ExportSectionHeader;
     struct LargeLoaderModuleEntry* Prev;
     struct LargeLoaderModuleEntry* Next;
+};
+
+struct LargeLoaderImportResolutionResult
+{
+    LPVOID MainAddress; // always populated, on ARM64EC this is address into main IAT, which can point to X64 code or ARM64EC code
+    LPVOID AuxiliaryAddress; // Only populated on ARM64EC if auxiliary export table has a symbol, otherwise NULL
 };
 
 static BOOL VerboseLoggingEnabled;
@@ -341,7 +349,7 @@ static LPVOID FindWin32ExportForLargeImportByName(const LPCSTR ImportName, const
 }
 
 // ImportNameLen includes the null terminator
-static LPVOID FindLargeExportForLargeImportData(struct LargeLoaderExportSectionHeader* ExportsSectionHeader, const LPCSTR ImportName, const DWORD ImportNameLen, const BYTE ImportKind, const BOOL AllowLogging)
+static struct LargeLoaderImportResolutionResult FindLargeExportForLargeImportData(struct LargeLoaderExportSectionHeader* ExportsSectionHeader, const LPCSTR ImportName, const DWORD ImportNameLen, const BYTE ImportKind, const BOOL AllowLogging)
 {
     // Calculate the hash of the name based on the provided hashing algorithm
     ULONGLONG ImportNameHash = 0;
@@ -358,6 +366,11 @@ static LPVOID FindLargeExportForLargeImportData(struct LargeLoaderExportSectionH
     BYTE* ExportImageBase = (BYTE*) ExportsSectionHeader - ExportsSectionHeader->SectionHeaderRVA;
     BYTE* ExportTable = (BYTE*) ExportsSectionHeader + ExportsSectionHeader->ExportTableOffset;
     UINT_PTR* ExportRVATable = (UINT_PTR*) ((BYTE*) ExportsSectionHeader + ExportsSectionHeader->ExportRVATableOffset);
+
+    // Calculate the address of the auxiliary export RVA table if this image is of the newer version and has an auxiliary export table
+    UINT_PTR* AuxiliaryExportRVATable = NULL;
+    if (ExportsSectionHeader->Version >= LARGE_LOADER_VERSION_ARM64EC_EXPORTAS && ExportsSectionHeader->AuxExportRVATableOffset != 0)
+        AuxiliaryExportRVATable = (UINT_PTR*) ((BYTE*) ExportsSectionHeader + ExportsSectionHeader->AuxExportRVATableOffset);
 
     // Iterate over all exports in this hash bucket to attempt and find one matching this import
     for (DWORD LocalExportIndex = 0; LocalExportIndex < HashBucket.NumExports; LocalExportIndex++)
@@ -386,19 +399,34 @@ static LPVOID FindLargeExportForLargeImportData(struct LargeLoaderExportSectionH
             if (LoaderExport->NameLen == ImportNameLen && memcmp(ExportName, ImportName, LoaderExport->NameLen) == 0)
             {
                 // Calculate the virtual address of the export by adding export image base to the export RVA
-                return ExportImageBase + ExportRVATable[GlobalExportIndex];
+                struct LargeLoaderImportResolutionResult ResolutionResult;
+                ResolutionResult.MainAddress = ExportImageBase + ExportRVATable[GlobalExportIndex];
+                // Auxiliary address is only available if there is an auxiliary RVA table for this image
+                ResolutionResult.AuxiliaryAddress = AuxiliaryExportRVATable ? ExportImageBase + AuxiliaryExportRVATable[GlobalExportIndex] : NULL;
+
+                // Set the auxiliary export address to the main address if this export represents data, and the image has no auxiliary export table. On ARM64EC, data is shared by both ARM64EC code and X64 code
+                // Technically we should never end up referencing data through auxiliary IAT, but this is possible when import does not know if it refers to data or to code,
+                // which is a case when linking with auto wildcard imports enabled
+                if (!ResolutionResult.AuxiliaryAddress && ResolutionResult.MainAddress && LoaderExport->ImportKind == LARGE_LOADER_IMPORT_TYPE_DATA)
+                    ResolutionResult.AuxiliaryAddress = ResolutionResult.MainAddress;
+
+                return ResolutionResult;
             }
         }
     }
+
     // We have not found a matching export, so return NULL
-    return NULL;
+    struct LargeLoaderImportResolutionResult NullResolutionResult;
+    NullResolutionResult.MainAddress = NULL;
+    NullResolutionResult.AuxiliaryAddress = NULL;
+    return NullResolutionResult;
 }
 
-static LPVOID FindLargeExportForLargeImport(struct LargeLoaderExportSectionHeader* ExportsSection, const struct LargeLoaderImport* Import, BOOL AllowLogging) {
+static struct LargeLoaderImportResolutionResult FindLargeExportForLargeImport(struct LargeLoaderExportSectionHeader* ExportsSection, const struct LargeLoaderImport* Import, BOOL AllowLogging) {
     return FindLargeExportForLargeImportData(ExportsSection, (LPCSTR) ((BYTE*) Import + Import->NameOffset), Import->NameLen, Import->ImportKind, AllowLogging);
 }
 
-static LPVOID ResolveFullyQualifiedImportChecked(struct LargeLoaderImportSectionHeader* LargeImportSectionHeader, struct LargeLoaderImport* LoaderImport)
+static struct LargeLoaderImportResolutionResult ResolveFullyQualifiedImportChecked(struct LargeLoaderImportSectionHeader* LargeImportSectionHeader, struct LargeLoaderImport* LoaderImport)
 {
     struct LargeLoaderExportSectionHeader*** ImportedExportSections = (struct LargeLoaderExportSectionHeader***) ((BYTE*) LargeImportSectionHeader + LargeImportSectionHeader->ImportedExportSectionsOffset);
     const LPCSTR ImportImageFilename = (LPCSTR) ((BYTE*) LargeImportSectionHeader + LargeImportSectionHeader->ImageFilenameOffset);
@@ -410,20 +438,23 @@ static LPVOID ResolveFullyQualifiedImportChecked(struct LargeLoaderImportSection
 
     // Resolve the export address now
     LogLinkVerbose("Linking import %s (kind: %d) from library %s", ImportName, LoaderImport->ImportKind, ExportLibraryImageFilename);
-    LPVOID ResolvedExportAddress = FindLargeExportForLargeImport(LibraryExportSectionHeader, LoaderImport, TRUE);
+    struct LargeLoaderImportResolutionResult ResolvedExportAddress = FindLargeExportForLargeImport(LibraryExportSectionHeader, LoaderImport, TRUE);
 
-    if (ResolvedExportAddress == NULL)
+    if (ResolvedExportAddress.MainAddress == NULL)
         LogLinkErrorAndAbort("Failed to find export for import %s of kind %d in shared library %s (requested by library %s)", ImportName, LoaderImport->ImportKind, ExportLibraryImageFilename, ImportImageFilename);
     return ResolvedExportAddress;
 }
 
-static LPVOID ResolveWildcardImportChecked(struct LargeLoaderImportSectionHeader* LargeImportSectionHeader, struct LargeLoaderImport* LoaderImport)
+static struct LargeLoaderImportResolutionResult ResolveWildcardImportChecked(struct LargeLoaderImportSectionHeader* LargeImportSectionHeader, struct LargeLoaderImport* LoaderImport)
 {
     const LPCSTR ImportImageFilename = (LPCSTR) ((BYTE*) LargeImportSectionHeader + LargeImportSectionHeader->ImageFilenameOffset);
     const LPCSTR ImportName = (LPCSTR) ((BYTE*) LoaderImport + LoaderImport->NameOffset);
 
     // Acquire the lock and attempt to look up the import in any loaded dynamic library
-    PVOID ResolvedExportAddress = NULL;
+    struct LargeLoaderImportResolutionResult ResolvedExportAddress;
+    ResolvedExportAddress.MainAddress = NULL;
+    ResolvedExportAddress.AuxiliaryAddress = NULL;
+
     {
         AcquireSRWLockShared(&LoadedModulesListLock);
         const struct LargeLoaderModuleEntry* Current = LoadedModulesListHead;
@@ -435,7 +466,7 @@ static LPVOID ResolveWildcardImportChecked(struct LargeLoaderImportSectionHeader
             // Attempt to find the import definition inside of this library
             LogLinkVerbose("Attempting to link wildcard import %s (kind: %d) to library %s", ImportName, LoaderImport->ImportKind, ExportLibraryImageFilename);
             ResolvedExportAddress = FindLargeExportForLargeImport(LibraryExportSectionHeader, LoaderImport, TRUE);
-            if (ResolvedExportAddress != NULL)
+            if (ResolvedExportAddress.MainAddress != NULL)
                 break;
             Current = Current->Next;
         }
@@ -443,14 +474,22 @@ static LPVOID ResolveWildcardImportChecked(struct LargeLoaderImportSectionHeader
     }
 
     // Attempt to resolve the wildcard import using the Win32 export directory if we are asked to do it
-    if ((LoaderImport->ImportFlags & LARGE_LOADER_IMPORT_FLAGS_WILDCARD_LOOKUP_WIN32_EXPORT_DIRECTORY) != 0)
+    if ((LoaderImport->ImportFlags & LARGE_LOADER_IMPORT_FLAG_WILDCARD_LOOKUP_WIN32_EXPORT_DIRECTORY) != 0)
     {
         LogLinkVerbose("Attempting to link wildcard import %s (kind: %d) using Win32 export directory of loaded modules", ImportName, LoaderImport->ImportKind);
-        ResolvedExportAddress = FindWin32ExportForLargeImportByName(ImportName, LoaderImport->NameLen, TRUE);
+        LPVOID MainExportAddress = FindWin32ExportForLargeImportByName(ImportName, LoaderImport->NameLen, TRUE);
+        ResolvedExportAddress.MainAddress = MainExportAddress;
+        ResolvedExportAddress.AuxiliaryAddress = NULL;
+
+        // If this import type is data, or it is a wildcard import that is suspected to be data (weak_data flag), set the auxiliary address to the main address
+        // Even if the target turns out to be code if this is a weak data hint, weak data flag implies that the caller only performs indirect calls through the function pointer,
+        // which is correctly handled under ARM64EC even if it points to ARM64EC code and not to the native code
+        if (ResolvedExportAddress.MainAddress && (LoaderImport->ImportKind == LARGE_LOADER_IMPORT_TYPE_DATA || (LoaderImport->ImportFlags & LARGE_LOADER_IMPORT_FLAG_WEAK_DATA) != 0))
+            ResolvedExportAddress.AuxiliaryAddress = ResolvedExportAddress.MainAddress;
     }
 
     // Check that we have actually resolved the address
-    if (ResolvedExportAddress == NULL)
+    if (ResolvedExportAddress.MainAddress == NULL)
         LogLinkErrorAndAbort("Failed to link wildcard import %s of kind %d in any currently loaded shared library (requested by library %s)", ImportName, LoaderImport->ImportKind, ImportImageFilename);
     return ResolvedExportAddress;
 }
@@ -472,7 +511,11 @@ EXTERN_C LARGE_LOADER_API FARPROC GetLargeProcAddress(const HMODULE Module, cons
     // Resolve the export within the exports section
     const DWORD ProcNameLen = strlen(ProcName);
     // We do not know whenever the caller wants a data or code export, so match any
-    return FindLargeExportForLargeImportData(ExportSection, ProcName, ProcNameLen, LARGE_LOADER_IMPORT_TYPE_WILDCARD, FALSE);
+    struct LargeLoaderImportResolutionResult Result = FindLargeExportForLargeImportData(ExportSection, ProcName, ProcNameLen, LARGE_LOADER_IMPORT_TYPE_WILDCARD, FALSE);
+
+    // We also do not know if the caller is a native ARM64EC caller or emulated X64 code under ARM64EC, so return the main export address, which will always be set
+    // native ARM64EC will never issue indirect calls into unknown addresses without routing them through __os_arm64x_check_icall, so returning X64 address is safe here
+    return Result.MainAddress;
 }
 
 EXTERN_C LARGE_LOADER_API void __large_loader_register(const HMODULE ImageBase, struct LargeLoaderExportSectionHeader* LargeExportSectionHeader)
@@ -557,6 +600,11 @@ EXTERN_C LARGE_LOADER_API void __large_loader_link(HMODULE ImageBase, struct Lar
     struct LargeLoaderExportSectionHeader*** ImportedExportSections = (struct LargeLoaderExportSectionHeader***) ((BYTE*) LargeImportSectionHeader + LargeImportSectionHeader->ImportedExportSectionsOffset);
     BYTE* ImportTable = (BYTE*) LargeImportSectionHeader + LargeImportSectionHeader->ImportTableOffset;
 
+    // Calculate the auxiliary import table address for ARM64EC
+    LPVOID* AuxiliaryImportAddressTable = NULL;
+    if (LargeImportSectionHeader->Version >= LARGE_LOADER_VERSION_ARM64EC_EXPORTAS && LargeImportSectionHeader->AuxiliaryAddressTableOffset != 0)
+        AuxiliaryImportAddressTable = (LPVOID*) ((BYTE*) LargeImportSectionHeader + LargeImportSectionHeader->AuxiliaryAddressTableOffset);
+
     // Log additional information about the library being linked
     LogLinkVerbose("Linking image %s version %d with %d imports from %d shared libraries: ",
         ImportImageFilename, LargeImportSectionHeader->Version, LargeImportSectionHeader->NumImports, LargeImportSectionHeader->NumExportSections);
@@ -600,7 +648,9 @@ EXTERN_C LARGE_LOADER_API void __large_loader_link(HMODULE ImageBase, struct Lar
         if (LoaderImport->NameLen >= 256 || LoaderImport->NameLen == 0 || ImportName[LoaderImport->NameLen] != 0)
             LogLinkErrorAndAbort("Corrupt image: Import name has invalid length or is not null terminated correctly for import index %d of image %s", ImportIndex, ImportImageFilename);
 
-        LPVOID ResolvedExportAddress = NULL;
+        struct LargeLoaderImportResolutionResult ResolvedExportAddress;
+        ResolvedExportAddress.MainAddress = NULL;
+        ResolvedExportAddress.AuxiliaryAddress = NULL;
 
         // Attempt to resolve a fully qualified import
         if (LoaderImport->ExportSectionIndex != 0xFFFF)
@@ -621,7 +671,9 @@ EXTERN_C LARGE_LOADER_API void __large_loader_link(HMODULE ImageBase, struct Lar
 
         // Write the export address to the address table for this import
         LogLinkVerbose("Linked import %s to export address %p", ImportName, ResolvedExportAddress);
-        ImportAddressTable[ImportIndex] = ResolvedExportAddress;
+        ImportAddressTable[ImportIndex] = ResolvedExportAddress.MainAddress;
+        if (AuxiliaryImportAddressTable)
+            AuxiliaryImportAddressTable[ImportIndex] = ResolvedExportAddress.AuxiliaryAddress;
     }
 
     // Restore the original flags on the import address table page to disallow writing to it
