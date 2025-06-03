@@ -56,9 +56,10 @@ static void LogLinkVerbose(const char* format, ...)
     // Only do the actual logging if verbose logging is enabled
     if (VerboseLoggingEnabled)
     {
-        char messageBuffer[1024] = {0};
+        char messageBuffer[4096] = {0};
         vsnprintf(messageBuffer, sizeof(messageBuffer), format, args);
         printf("Large Loader: %s\n", messageBuffer);
+        OutputDebugStringA(messageBuffer);
     }
     va_end(args);
 }
@@ -66,13 +67,14 @@ static void LogLinkVerbose(const char* format, ...)
 // Prints a message into the stdout, triggers an assert in debug builds, opens a user error message box and aborts the process
 static void LogLinkErrorAndAbort(const char* format, ...)
 {
-    char errorMessageBuffer[500] = {0};
+    char errorMessageBuffer[4096] = {0};
     va_list args;
     va_start(args, format);
     vsnprintf(errorMessageBuffer, sizeof(errorMessageBuffer), format, args);
     va_end(args);
 
     fprintf(stderr, "[fatal] Large Loader: %s\n", errorMessageBuffer);
+    OutputDebugStringA(errorMessageBuffer);
 #ifndef NDEBUG
     _assert(errorMessageBuffer, __FILE__, __LINE__);
 #endif
@@ -388,8 +390,8 @@ static struct LargeLoaderImportResolutionResult FindLargeExportForLargeImportDat
         if (AllowLogging)
         {
             // Only do this if allow logging is true since this function can be called through GetLargeProcAddress, for which we do not want to do any logging
-            LogLinkVerbose("[Export %d Bucket %llu]: Export name is %s (kind: %d) with export hash %llu vs Import Hash %llu (kind: %d)",
-               GlobalExportIndex, HashBucketIndex, ExportName, LoaderExport->ImportKind, LoaderExport->ExportHash, ImportNameHash, ImportKind);
+            //LogLinkVerbose("[Export %d Bucket %llu]: Export name is %s (kind: %d) with export hash %llu vs Import Hash %llu (kind: %d)",
+            //   GlobalExportIndex, HashBucketIndex, ExportName, LoaderExport->ImportKind, LoaderExport->ExportHash, ImportNameHash, ImportKind);
         }
 
         // Only consider exports that have the name hash match and the import kind matches exactly (or ImportKind is 0xFFFF, which stands for wildcard)
