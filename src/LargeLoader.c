@@ -56,10 +56,9 @@ static void LogLinkVerbose(const char* format, ...)
     // Only do the actual logging if verbose logging is enabled
     if (VerboseLoggingEnabled)
     {
-        char messageBuffer[4096] = {0};
-        vsnprintf(messageBuffer, sizeof(messageBuffer), format, args);
-        printf("Large Loader: %s\n", messageBuffer);
-        OutputDebugStringA(messageBuffer);
+        char logMessageBuffer[4096] = {0};
+        vsnprintf(logMessageBuffer, sizeof(logMessageBuffer), format, args);
+        printf("Large Loader: %s\n", logMessageBuffer);
     }
     va_end(args);
 }
@@ -67,19 +66,21 @@ static void LogLinkVerbose(const char* format, ...)
 // Prints a message into the stdout, triggers an assert in debug builds, opens a user error message box and aborts the process
 static void LogLinkErrorAndAbort(const char* format, ...)
 {
-    char errorMessageBuffer[4096] = {0};
     va_list args;
     va_start(args, format);
+    char errorMessageBuffer[4096] = {0};
     vsnprintf(errorMessageBuffer, sizeof(errorMessageBuffer), format, args);
     va_end(args);
 
+    // Flush the output streams before we show the dialog box and exit
+    fflush(stdout);
     fprintf(stderr, "[fatal] Large Loader: %s\n", errorMessageBuffer);
-    OutputDebugStringA(errorMessageBuffer);
+    fflush(stderr);
 #ifndef NDEBUG
     _assert(errorMessageBuffer, __FILE__, __LINE__);
 #endif
     MessageBoxA(NULL, errorMessageBuffer, "Large Loader: Fatal Link Error", MB_OK);
-    abort();
+    exit(3);
 }
 
 // Basic implementation of RtlImageNtHeaderEx without exception handling and boundary checking
@@ -383,8 +384,9 @@ static struct LargeLoaderImportResolutionResult FindLargeExportForLargeImportDat
 
         // Sanity check the name of the export
         LPCSTR ExportName = (LPCSTR) ((BYTE*) LoaderExport + LoaderExport->NameOffset);
-        if (LoaderExport->NameLen >= 256 || LoaderExport->NameLen == 0 || ExportName[LoaderExport->NameLen] != 0)
-            LogLinkErrorAndAbort("Corrupt image: Export name has invalid length or is not null terminated correctly for export index %d while resolving import %s", GlobalExportIndex, ImportName);
+        if (LoaderExport->NameLen > 1024 || LoaderExport->NameLen == 0 || ExportName[LoaderExport->NameLen] != 0)
+            LogLinkErrorAndAbort("Corrupt image: Export name has invalid length or is not null terminated correctly for export index %d while resolving import %s NameLen: %d",
+                GlobalExportIndex, ImportName, LoaderExport->NameLen);
 
         // Log all the exports in the bucket if we are running with verbose logging until we match one
         if (AllowLogging)
@@ -647,8 +649,9 @@ EXTERN_C LARGE_LOADER_API void __large_loader_link(HMODULE ImageBase, struct Lar
 
         // Make sure the import is null terminated and has a reasonable length
         LPCSTR ImportName = (LPCSTR) ((BYTE*) LoaderImport + LoaderImport->NameOffset);
-        if (LoaderImport->NameLen >= 256 || LoaderImport->NameLen == 0 || ImportName[LoaderImport->NameLen] != 0)
-            LogLinkErrorAndAbort("Corrupt image: Import name has invalid length or is not null terminated correctly for import index %d of image %s", ImportIndex, ImportImageFilename);
+        if (LoaderImport->NameLen >= 1024 || LoaderImport->NameLen == 0 || ImportName[LoaderImport->NameLen] != 0)
+            LogLinkErrorAndAbort("Corrupt image: Import name has invalid length or is not null terminated correctly for import index %d of image %s. NameLen: %d",
+                ImportIndex, ImportImageFilename, LoaderImport->NameLen);
 
         struct LargeLoaderImportResolutionResult ResolvedExportAddress;
         ResolvedExportAddress.MainAddress = NULL;
