@@ -8,7 +8,8 @@
     _ACRTIMP void __cdecl _assert(const char*, const char*, unsigned); // NOLINT(*-reserved-identifier)
 #endif
 
-#define CURRENT_LARGE_LOADER_VERSION LARGE_LOADER_VERSION_ARM64EC_EXPORTAS
+#define CURRENT_LARGE_LOADER_VERSION LARGE_LOADER_VERSION_CIRCULAR_DEPS
+#define LINKER_PLACEHOLDER_ADDRESS_VALUE (LPVOID)1
 
 struct LargeLoaderModuleEntry
 {
@@ -604,6 +605,24 @@ EXTERN_C LARGE_LOADER_API void __large_loader_link(HMODULE ImageBase, struct Lar
     struct LargeLoaderExportSectionHeader*** ImportedExportSections = (struct LargeLoaderExportSectionHeader***) ((BYTE*) LargeImportSectionHeader + LargeImportSectionHeader->ImportedExportSectionsOffset);
     BYTE* ImportTable = (BYTE*) LargeImportSectionHeader + LargeImportSectionHeader->ImportTableOffset;
 
+    // Skip linking images that have zero imports. In such cases the linker should not generate the large imports section at all
+    if (LargeImportSectionHeader->NumImports == 0)
+    {
+        LogLinkVerbose("Skipping linking image %s because it has no imports", ImportImageFilename);
+        return;
+    }
+    // If first entry in the address table is not zero, we have already linked this image, or are presently in the process of linking it (in case of circular dependencies)
+    if (ImportAddressTable[0] != 0)
+    {
+        // If first import is set to the placeholder address value, we are in the process of linking images with cyclic dependencies,
+        // and this image is already on the link stack and as such will be linked later
+        if (ImportAddressTable[0] == LINKER_PLACEHOLDER_ADDRESS_VALUE)
+            LogLinkVerbose("Discarding image %s link request because it is already on the cyclic dependency resolution stack", ImportImageFilename);
+        else
+            LogLinkVerbose("Discarding image %s link request because it has already been linked", ImportImageFilename);
+        return;
+    }
+
     // Calculate the auxiliary import table address for ARM64EC
     LPVOID* AuxiliaryImportAddressTable = NULL;
     if (LargeImportSectionHeader->Version >= LARGE_LOADER_VERSION_ARM64EC_EXPORTAS && LargeImportSectionHeader->AuxiliaryAddressTableOffset != 0)
@@ -613,10 +632,23 @@ EXTERN_C LARGE_LOADER_API void __large_loader_link(HMODULE ImageBase, struct Lar
     LogLinkVerbose("Linking image %s version %d with %d imports from %d shared libraries: ",
         ImportImageFilename, LargeImportSectionHeader->Version, LargeImportSectionHeader->NumImports, LargeImportSectionHeader->NumExportSections);
 
-    // Validate the export sections referenced by this library before we attempt to work with them
+    // Allow writing to the import address table while we are resolving imports
+    DWORD ImportAddressTableSize = sizeof(LPVOID) * LargeImportSectionHeader->NumImports;
+    DWORD OldPageProtectionFlags = 0;
+    BOOL MemoryProtectSucceeded = VirtualProtect(ImportAddressTable, ImportAddressTableSize, PAGE_READWRITE, &OldPageProtectionFlags);
+    if (!MemoryProtectSucceeded)
+        LogLinkErrorAndAbort("Failed to clear read-only protection status from the import address table of image %s", ImportImageFilename);
+
+    // Now that we can write to the import address table, set the first entry to the placeholder address value,
+    // so when we are processing cyclic dependencies, we will not attempt to link this image again when it is already on the link stack
+    ImportAddressTable[0] = LINKER_PLACEHOLDER_ADDRESS_VALUE;
+
+    // Validate the export sections referenced by this library before we attempt to work with them. In case of cyclic dependencies,
+    // this might also cause the dependency images to be linked immediately without waiting for their normal DllMain execution
     for (DWORD LibraryIndex = 0; LibraryIndex < LargeImportSectionHeader->NumExportSections; LibraryIndex++)
     {
         struct LargeLoaderExportSectionHeader* ExportLibraryHeader = *ImportedExportSections[LibraryIndex];
+        const HMODULE ExportLibraryImageBase = (HMODULE) ((BYTE*) ExportLibraryHeader - ExportLibraryHeader->SectionHeaderRVA);
         const LPCSTR ExportLibraryImageFilename = (LPCSTR) ((BYTE*) ExportLibraryHeader + ExportLibraryHeader->ImageFilenameOffset);
 
         // Sanity check the export section header version. We cannot handle versions above our current version
@@ -632,14 +664,24 @@ EXTERN_C LARGE_LOADER_API void __large_loader_link(HMODULE ImageBase, struct Lar
         // Log the information about this library if necessary
         LogLinkVerbose("- %s [version %d, hashing algo %d with %d buckets and %d exports]", ExportLibraryImageFilename,
             ExportLibraryHeader->Version, ExportLibraryHeader->HashingAlgorithm, ExportLibraryHeader->NumExportBuckets, ExportLibraryHeader->NumExports);
-    }
 
-    // Allow writing to the import address table while we are resolving imports
-    DWORD ImportAddressTableSize = sizeof(LPVOID) * LargeImportSectionHeader->NumImports;
-    DWORD OldPageProtectionFlags = 0;
-    BOOL MemoryProtectSucceeded = VirtualProtect(ImportAddressTable, ImportAddressTableSize, PAGE_READWRITE, &OldPageProtectionFlags);
-    if (!MemoryProtectSucceeded)
-        LogLinkErrorAndAbort("Failed to clear read-only protection status from the import address table of image %s", ImportImageFilename);
+        // If this image contains information necessary to resolve cyclic dependencies, check if it has been linked already
+        if (ExportLibraryHeader->Version >= LARGE_LOADER_VERSION_CIRCULAR_DEPS && ExportLibraryHeader->ImportSectionHeaderLength > 0)
+        {
+            // We do not perform additional validation on import directory here (e.g. version validity) because we assume that export and import directories are generated by the same linker
+            struct LargeLoaderImportSectionHeader* ExportLibraryImportHeader = (struct LargeLoaderImportSectionHeader*) ((BYTE*) ExportLibraryHeader + ExportLibraryHeader->ImportSectionHeaderOffset);
+            const LPVOID* ExportLibraryImportAddressTable = (LPVOID*) ((BYTE*) ExportLibraryImportHeader + ExportLibraryImportHeader->AddressTableOffset);
+
+            // If image that we depend on has not been linked yet (because of cyclic dependencies), link it now
+            // Since our image might call functions in the dependency image, which might call functions in its dependency images, we have to get the entire cyclic dependency
+            // chain linked by the time we finish linking the image we are currently linking
+            if (ExportLibraryImportHeader->NumImports > 0 && ExportLibraryImportAddressTable[0] == 0)
+            {
+                LogLinkVerbose("Linking dependency library %s out of order because of cyclic dependencies", ExportLibraryImageFilename);
+                __large_loader_link(ExportLibraryImageBase, ExportLibraryImportHeader);
+            }
+        }
+    }
 
     // Resolve imports now
     for (DWORD ImportIndex = 0; ImportIndex < LargeImportSectionHeader->NumImports; ImportIndex++)
@@ -683,5 +725,6 @@ EXTERN_C LARGE_LOADER_API void __large_loader_link(HMODULE ImageBase, struct Lar
 
     // Restore the original flags on the import address table page to disallow writing to it
     VirtualProtect(ImportAddressTable, ImportAddressTableSize, OldPageProtectionFlags, &OldPageProtectionFlags);
+
     LogLinkVerbose("Successfully linked image %s", ImportImageFilename);
 }

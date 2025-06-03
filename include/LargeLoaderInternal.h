@@ -28,6 +28,7 @@
 enum COFFLargeLoaderVersion {
     LARGE_LOADER_VERSION_INITIAL = 1,
     LARGE_LOADER_VERSION_ARM64EC_EXPORTAS = 2,
+    LARGE_LOADER_VERSION_CIRCULAR_DEPS = 3,
 };
 
 // Internal definitions for Large Loader
@@ -99,6 +100,8 @@ struct LargeLoaderExportSectionHeader {
     DWORD ImageFilenameOffset;
     DWORD ImageFilenameLength;
     DWORD AuxExportRVATableOffset;
+    LONG ImportSectionHeaderOffset;
+    DWORD ImportSectionHeaderLength;
 };
 
 EXTERN_C LARGE_LOADER_API void __large_loader_register(HMODULE ImageBase, struct LargeLoaderExportSectionHeader* LargeExportSectionHeader); // NOLINT(*-reserved-identifier)
