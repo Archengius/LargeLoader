@@ -1,15 +1,16 @@
 #include "LargeLoaderInternal.h"
 #include "city.h"
-#include <assert.h>
 #include <stdio.h>
 #include <Winternl.h>
 
-#ifndef NDEBUG
-    _ACRTIMP void __cdecl _assert(const char*, const char*, unsigned); // NOLINT(*-reserved-identifier)
-#endif
-
 #define CURRENT_LARGE_LOADER_VERSION LARGE_LOADER_VERSION_CIRCULAR_DEPS
 #define LINKER_PLACEHOLDER_ADDRESS_VALUE (LPVOID)1
+
+#define LINKER_LOG_LEVEL_FATAL 0
+#define LINKER_LOG_LEVEL_ERROR 1
+#define LINKER_LOG_LEVEL_LOG 2
+#define LINKER_LOG_LEVEL_VERBOSE 3
+#define LINKER_LOG_LEVEL_VERY_VERBOSE 4
 
 struct LargeLoaderModuleEntry
 {
@@ -25,7 +26,7 @@ struct LargeLoaderImportResolutionResult
     LPVOID AuxiliaryAddress; // Only populated on ARM64EC if auxiliary export table has a symbol, otherwise NULL
 };
 
-static BOOL VerboseLoggingEnabled;
+static DWORD VerboseLoggingLevel = 0;
 static SRWLOCK LoadedModulesListLock;
 static struct LargeLoaderModuleEntry* LoadedModulesListHead;
 
@@ -37,11 +38,19 @@ EXTERN_C BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason)
         DisableThreadLibraryCalls(instance);
 
         // Check if we want verbose logging or not
+        const char* VerbosityLevelStr = getenv("LARGE_LOADER_VERBOSE");
+        if (VerbosityLevelStr)
+        {
+            VerboseLoggingLevel = strtoul(VerbosityLevelStr, 0, 0);
+        }
+        else
+        {
 #if _DEBUG
-        VerboseLoggingEnabled = TRUE;
+            VerboseLoggingLevel = LINKER_LOG_LEVEL_LOG; // Enable logging by default in debug builds
 #else
-        VerboseLoggingEnabled = getenv("LARGE_LOADER_VERBOSE") != NULL;
+            VerboseLoggingLevel = LINKER_LOG_LEVEL_ERROR; // Only errors if env variable is not provided in release builds
 #endif
+        }
         // Initialize the loaded modules lock
         InitializeSRWLock(&LoadedModulesListLock);
         LoadedModulesListHead = NULL;
@@ -49,39 +58,62 @@ EXTERN_C BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason)
     return TRUE;
 }
 
-// Prints a message to the stdout if verbose logging is enabled
-static void LogLinkVerbose(const char* format, ...)
+static const char* LogLinkVerbosityToString(DWORD VerbosityLevel)
 {
-    va_list args;
-    va_start(args, format);
-    // Only do the actual logging if verbose logging is enabled
-    if (VerboseLoggingEnabled)
+    switch (VerbosityLevel)
     {
-        char logMessageBuffer[4096] = {0};
-        vsnprintf(logMessageBuffer, sizeof(logMessageBuffer), format, args);
-        printf("Large Loader: %s\n", logMessageBuffer);
+        case LINKER_LOG_LEVEL_FATAL: return "Fatal";
+        case LINKER_LOG_LEVEL_ERROR: return "Error";
+        case LINKER_LOG_LEVEL_LOG: return "Log";
+        case LINKER_LOG_LEVEL_VERBOSE: return "Verbose";
+        case LINKER_LOG_LEVEL_VERY_VERBOSE: return "VeryVerbose";
+        default: return "Unknown";
     }
-    va_end(args);
 }
 
-// Prints a message into the stdout, triggers an assert in debug builds, opens a user error message box and aborts the process
-static void LogLinkErrorAndAbort(const char* format, ...)
+static void LogLink(DWORD VerbosityLevel, const char* MessageFormat, ...)
 {
-    va_list args;
-    va_start(args, format);
-    char errorMessageBuffer[4096] = {0};
-    vsnprintf(errorMessageBuffer, sizeof(errorMessageBuffer), format, args);
-    va_end(args);
+    va_list Args;
+    va_start(Args, MessageFormat);
+    if (VerboseLoggingLevel >= VerbosityLevel || VerbosityLevel == LINKER_LOG_LEVEL_FATAL)
+    {
+        // Format the message provided to the function first
+        char FormattedMessageBuffer[4096] = {0};
+        vsnprintf(FormattedMessageBuffer, sizeof(FormattedMessageBuffer), MessageFormat, Args);
 
-    // Flush the output streams before we show the dialog box and exit
-    fflush(stdout);
-    fprintf(stderr, "[fatal] Large Loader: %s\n", errorMessageBuffer);
-    fflush(stderr);
-#ifndef NDEBUG
-    _assert(errorMessageBuffer, __FILE__, __LINE__);
-#endif
-    MessageBoxA(NULL, errorMessageBuffer, "Large Loader: Fatal Link Error", MB_OK);
-    exit(3);
+        // Create a log line from the formatted message and verbosity
+        char LogLineMessageBuffer[4096] = {0};
+        sprintf_s(LogLineMessageBuffer, sizeof(LogLineMessageBuffer), "LogLargeLoader: %s: %s\n",
+            LogLinkVerbosityToString(VerbosityLevel), FormattedMessageBuffer);
+
+        // We always print to debugger output feed
+        OutputDebugStringA(LogLineMessageBuffer);
+
+        // For fatal logs, we print to error output, show the dialog box, and immediately exit without running termination code
+        // We do not run the termination code because link failure will most likely result in access violation if terminators
+        // attempt to access symbols that failed to be resolved by the loader
+        if (VerbosityLevel == LINKER_LOG_LEVEL_FATAL)
+        {
+            fprintf(stderr, "FATAL: %s", LogLineMessageBuffer);
+            fflush(stderr);
+
+            MessageBoxA(NULL, LogLineMessageBuffer, "Large Loader: Fatal Link Error", MB_OK);
+            __fastfail(FAST_FAIL_FATAL_APP_EXIT);
+        }
+        // For error logs, we print to stderr and immediately flush it
+        if (VerbosityLevel <= LINKER_LOG_LEVEL_ERROR)
+        {
+            fprintf(stderr, "%s", LogLineMessageBuffer);
+            fflush(stderr);
+        }
+        else
+        {
+            // For all other logs, we just print to stdout
+            fprintf(stdout, "%s", LogLineMessageBuffer);
+            fflush(stdout);
+        }
+    }
+    va_end(Args);
 }
 
 // Basic implementation of RtlImageNtHeaderEx without exception handling and boundary checking
@@ -179,14 +211,14 @@ static LPVOID ResolveWin32ExportFromImageBaseByName(const HMODULE ImageBase, con
     {
         const LPCSTR ForwarderName = (LPCSTR) ((BYTE*) ImageBase + ExportOrForwarderRVA);
         if (AllowLogging)
-            LogLinkVerbose("Resolved Import %s from Win32 Export directory of loaded module %s to forwarder descriptor %s", ExportName, ExportLibraryName, ForwarderName);
+            LogLink(LINKER_LOG_LEVEL_VERBOSE, "Resolved Import %s from Win32 Export directory of loaded module %s to forwarder descriptor %s", ExportName, ExportLibraryName, ForwarderName);
         return ResolveWin32ExportForwarder(ForwarderName, AllowLogging);
     }
 
     // Otherwise, this is just a normal export RVA, so resolve it with image base to get an absolute export address
     const LPVOID ExportAbsoluteAddress = (BYTE*) ImageBase + ExportOrForwarderRVA;
     if (AllowLogging)
-        LogLinkVerbose("Resolved Import %s from Win32 Export directory of loaded module %s to RVA %p", ExportName, ExportLibraryName, ExportAbsoluteAddress);
+        LogLink(LINKER_LOG_LEVEL_VERBOSE, "Resolved Import %s from Win32 Export directory of loaded module %s to RVA %p", ExportName, ExportLibraryName, ExportAbsoluteAddress);
     return ExportAbsoluteAddress;
 }
 
@@ -311,12 +343,12 @@ static LPVOID ResolveWin32ExportForwarder(const LPCSTR ForwarderDescriptor, cons
             if (ImportNameLen == 0)
             {
                 if (AllowLogging)
-                    LogLinkVerbose("Resolved forwarder into export by ordinal %d from module %s", ImportOrdinal, ModuleBaseName);
+                    LogLink(LINKER_LOG_LEVEL_VERBOSE, "Resolved forwarder into export by ordinal %d from module %s", ImportOrdinal, ModuleBaseName);
                 return ResolveWin32ExportFromImageBaseByOrdinal(ImageBase, ImportOrdinal, AllowLogging);
             }
             // Otherwise, resolve the export by its full name
             if (AllowLogging)
-                LogLinkVerbose("Resolved forwarder into export by name %s from module %s", ImportName, ModuleBaseName);
+                LogLink(LINKER_LOG_LEVEL_VERBOSE, "Resolved forwarder into export by name %s from module %s", ImportName, ModuleBaseName);
             return ResolveWin32ExportFromImageBaseByName(ImageBase, ImportName, ImportNameLen, AllowLogging);
         }
     }
@@ -360,7 +392,7 @@ static struct LargeLoaderImportResolutionResult FindLargeExportForLargeImportDat
     if (ExportsSectionHeader->HashingAlgorithm == LARGE_LOADER_HASH_ALGO_CityHash64)
         ImportNameHash = CityHash64(ImportName, ImportNameLen);
     else
-        LogLinkErrorAndAbort("Corrupt image: Unknown hashing algorithm ID %d when attempting to resolve import %s", ExportsSectionHeader->HashingAlgorithm, ImportName);
+        LogLink(LINKER_LOG_LEVEL_FATAL, "Corrupt image: Unknown hashing algorithm ID %d when attempting to resolve import %s", ExportsSectionHeader->HashingAlgorithm, ImportName);
 
     // Resolve the hash bucket to which the hash maps, and the address of the first export entry in the bucket
     const struct LargeLoaderExportHashBucket* ExportHashBucketTable = (const struct LargeLoaderExportHashBucket*) ((BYTE*) ExportsSectionHeader + ExportsSectionHeader->ExportHashBucketTableOffset);
@@ -386,7 +418,7 @@ static struct LargeLoaderImportResolutionResult FindLargeExportForLargeImportDat
         // Sanity check the name of the export
         LPCSTR ExportName = (LPCSTR) ((BYTE*) LoaderExport + LoaderExport->NameOffset);
         if (LoaderExport->NameLen > 1024 || LoaderExport->NameLen == 0 || ExportName[LoaderExport->NameLen] != 0)
-            LogLinkErrorAndAbort("Corrupt image: Export name has invalid length or is not null terminated correctly for export index %d while resolving import %s NameLen: %d",
+            LogLink(LINKER_LOG_LEVEL_FATAL, "Corrupt image: Export name has invalid length or is not null terminated correctly for export index %d while resolving import %s NameLen: %d",
                 GlobalExportIndex, ImportName, LoaderExport->NameLen);
 
         // Log all the exports in the bucket if we are running with verbose logging until we match one
@@ -442,11 +474,11 @@ static struct LargeLoaderImportResolutionResult ResolveFullyQualifiedImportCheck
     const LPCSTR ExportLibraryImageFilename = (LPCSTR) ((BYTE*) LibraryExportSectionHeader + LibraryExportSectionHeader->ImageFilenameOffset);
 
     // Resolve the export address now
-    LogLinkVerbose("Linking import %s (kind: %d) from library %s", ImportName, LoaderImport->ImportKind, ExportLibraryImageFilename);
+    LogLink(LINKER_LOG_LEVEL_VERBOSE, "Linking import %s (kind: %d) from library %s", ImportName, LoaderImport->ImportKind, ExportLibraryImageFilename);
     struct LargeLoaderImportResolutionResult ResolvedExportAddress = FindLargeExportForLargeImport(LibraryExportSectionHeader, LoaderImport, TRUE);
 
     if (ResolvedExportAddress.MainAddress == NULL)
-        LogLinkErrorAndAbort("Failed to find export for import %s of kind %d in shared library %s (requested by library %s)", ImportName, LoaderImport->ImportKind, ExportLibraryImageFilename, ImportImageFilename);
+        LogLink(LINKER_LOG_LEVEL_FATAL, "Failed to find export for import %s of kind %d in shared library %s (requested by library %s)", ImportName, LoaderImport->ImportKind, ExportLibraryImageFilename, ImportImageFilename);
     return ResolvedExportAddress;
 }
 
@@ -469,7 +501,7 @@ static struct LargeLoaderImportResolutionResult ResolveWildcardImportChecked(str
             const LPCSTR ExportLibraryImageFilename = (LPCSTR) ((BYTE*) LibraryExportSectionHeader + LibraryExportSectionHeader->ImageFilenameOffset);
 
             // Attempt to find the import definition inside of this library
-            LogLinkVerbose("Attempting to link wildcard import %s (kind: %d) to library %s", ImportName, LoaderImport->ImportKind, ExportLibraryImageFilename);
+            LogLink(LINKER_LOG_LEVEL_VERBOSE, "Attempting to link wildcard import %s (kind: %d) to library %s", ImportName, LoaderImport->ImportKind, ExportLibraryImageFilename);
             ResolvedExportAddress = FindLargeExportForLargeImport(LibraryExportSectionHeader, LoaderImport, TRUE);
             if (ResolvedExportAddress.MainAddress != NULL)
                 break;
@@ -481,7 +513,7 @@ static struct LargeLoaderImportResolutionResult ResolveWildcardImportChecked(str
     // Attempt to resolve the wildcard import using the Win32 export directory if we are asked to do it
     if ((LoaderImport->ImportFlags & LARGE_LOADER_IMPORT_FLAG_WILDCARD_LOOKUP_WIN32_EXPORT_DIRECTORY) != 0)
     {
-        LogLinkVerbose("Attempting to link wildcard import %s (kind: %d) using Win32 export directory of loaded modules", ImportName, LoaderImport->ImportKind);
+        LogLink(LINKER_LOG_LEVEL_VERY_VERBOSE, "Attempting to link wildcard import %s (kind: %d) using Win32 export directory of loaded modules", ImportName, LoaderImport->ImportKind);
         LPVOID MainExportAddress = FindWin32ExportForLargeImportByName(ImportName, LoaderImport->NameLen, TRUE);
         ResolvedExportAddress.MainAddress = MainExportAddress;
         ResolvedExportAddress.AuxiliaryAddress = NULL;
@@ -495,7 +527,7 @@ static struct LargeLoaderImportResolutionResult ResolveWildcardImportChecked(str
 
     // Check that we have actually resolved the address
     if (ResolvedExportAddress.MainAddress == NULL)
-        LogLinkErrorAndAbort("Failed to link wildcard import %s of kind %d in any currently loaded shared library (requested by library %s)", ImportName, LoaderImport->ImportKind, ImportImageFilename);
+        LogLink(LINKER_LOG_LEVEL_FATAL, "Failed to link wildcard import %s of kind %d in any currently loaded shared library (requested by library %s)", ImportName, LoaderImport->ImportKind, ImportImageFilename);
     return ResolvedExportAddress;
 }
 
@@ -529,11 +561,11 @@ EXTERN_C LARGE_LOADER_API void __large_loader_register(const HMODULE ImageBase, 
 
     // Sanity check the export section header version. We cannot handle versions above our current version
     if (LargeExportSectionHeader->Version > CURRENT_LARGE_LOADER_VERSION)
-        LogLinkErrorAndAbort("Corrupt image: Unknown header version %d for export section header of library at %p. Maximum supported version is %d", LargeExportSectionHeader->Version, ImageBase, CURRENT_LARGE_LOADER_VERSION);
+        LogLink(LINKER_LOG_LEVEL_FATAL, "Corrupt image: Unknown header version %d for export section header of library at %p. Maximum supported version is %d", LargeExportSectionHeader->Version, ImageBase, CURRENT_LARGE_LOADER_VERSION);
 
     // Sanity check the library filename. It must have a null terminator at the length provided, and the length must be reasonable <256
     if (LargeExportSectionHeader->ImageFilenameLength >= 256 || LargeExportSectionHeader->ImageFilenameLength == 0 || ExportLibraryImageFilename[LargeExportSectionHeader->ImageFilenameLength] != 0)
-        LogLinkErrorAndAbort("Corrupt image: Library filename has invalid length or is not terminated correctly for library at %p", ImageBase);
+        LogLink(LINKER_LOG_LEVEL_FATAL, "Corrupt image: Library filename has invalid length or is not terminated correctly for library at %p", ImageBase);
 
     // Create a new module list entry for this module
     struct LargeLoaderModuleEntry* NewModuleEntry = malloc(sizeof(struct LargeLoaderModuleEntry));
@@ -555,7 +587,7 @@ EXTERN_C LARGE_LOADER_API void __large_loader_register(const HMODULE ImageBase, 
         ReleaseSRWLockExclusive(&LoadedModulesListLock);
     }
     // Notify that we have loaded a new library
-    LogLinkVerbose("Registered large library %s in the loaded module list lookup", ExportLibraryImageFilename);
+    LogLink(LINKER_LOG_LEVEL_LOG, "Registered large library %s in the loaded module list lookup", ExportLibraryImageFilename);
 }
 
 #ifdef _M_X64
@@ -594,12 +626,12 @@ EXTERN_C LARGE_LOADER_API void __large_loader_link(HMODULE ImageBase, struct Lar
 {
     // Guard against versions newer than the current version, since we do not know how to parse them
     if (LargeImportSectionHeader->Version > CURRENT_LARGE_LOADER_VERSION)
-        LogLinkErrorAndAbort("Corrupt image: Unknown header version %d for import section header of image %p. Maximum supported version is %d", LargeImportSectionHeader->Version, ImageBase, CURRENT_LARGE_LOADER_VERSION);
+        LogLink(LINKER_LOG_LEVEL_FATAL, "Corrupt image: Unknown header version %d for import section header of image %p. Maximum supported version is %d", LargeImportSectionHeader->Version, ImageBase, CURRENT_LARGE_LOADER_VERSION);
 
     // Sanity check the filename. It must have a null terminator at the length provided, and the length must be reasonable <256
     LPCSTR ImportImageFilename = (LPCSTR) ((BYTE*) LargeImportSectionHeader + LargeImportSectionHeader->ImageFilenameOffset);
     if (LargeImportSectionHeader->ImageFilenameLength >= 256 || LargeImportSectionHeader->ImageFilenameLength == 0 || ImportImageFilename[LargeImportSectionHeader->ImageFilenameLength] != 0)
-        LogLinkErrorAndAbort("Corrupt image: Image filename has invalid length or is not terminated correctly for image at %p", ImageBase);
+        LogLink(LINKER_LOG_LEVEL_FATAL, "Corrupt image: Image filename has invalid length or is not terminated correctly for image at %p", ImageBase);
 
     LPVOID* ImportAddressTable = (LPVOID*) ((BYTE*) LargeImportSectionHeader + LargeImportSectionHeader->AddressTableOffset);
     struct LargeLoaderExportSectionHeader*** ImportedExportSections = (struct LargeLoaderExportSectionHeader***) ((BYTE*) LargeImportSectionHeader + LargeImportSectionHeader->ImportedExportSectionsOffset);
@@ -608,7 +640,7 @@ EXTERN_C LARGE_LOADER_API void __large_loader_link(HMODULE ImageBase, struct Lar
     // Skip linking images that have zero imports. In such cases the linker should not generate the large imports section at all
     if (LargeImportSectionHeader->NumImports == 0)
     {
-        LogLinkVerbose("Skipping linking image %s because it has no imports", ImportImageFilename);
+        LogLink(LINKER_LOG_LEVEL_LOG, "Skipping linking image %s because it has no imports", ImportImageFilename);
         return;
     }
     // If first entry in the address table is not zero, we have already linked this image, or are presently in the process of linking it (in case of circular dependencies)
@@ -617,9 +649,9 @@ EXTERN_C LARGE_LOADER_API void __large_loader_link(HMODULE ImageBase, struct Lar
         // If first import is set to the placeholder address value, we are in the process of linking images with cyclic dependencies,
         // and this image is already on the link stack and as such will be linked later
         if (ImportAddressTable[0] == LINKER_PLACEHOLDER_ADDRESS_VALUE)
-            LogLinkVerbose("Discarding image %s link request because it is already on the cyclic dependency resolution stack", ImportImageFilename);
+            LogLink(LINKER_LOG_LEVEL_LOG, "Discarding image %s link request because it is already on the cyclic dependency resolution stack", ImportImageFilename);
         else
-            LogLinkVerbose("Discarding image %s link request because it has already been linked", ImportImageFilename);
+            LogLink(LINKER_LOG_LEVEL_LOG, "Discarding image %s link request because it has already been linked", ImportImageFilename);
         return;
     }
 
@@ -629,7 +661,7 @@ EXTERN_C LARGE_LOADER_API void __large_loader_link(HMODULE ImageBase, struct Lar
         AuxiliaryImportAddressTable = (LPVOID*) ((BYTE*) LargeImportSectionHeader + LargeImportSectionHeader->AuxiliaryAddressTableOffset);
 
     // Log additional information about the library being linked
-    LogLinkVerbose("Linking image %s version %d with %d imports from %d shared libraries: ",
+    LogLink(LINKER_LOG_LEVEL_LOG, "Linking image %s version %d with %d imports from %d shared libraries: ",
         ImportImageFilename, LargeImportSectionHeader->Version, LargeImportSectionHeader->NumImports, LargeImportSectionHeader->NumExportSections);
 
     // Allow writing to the import address table while we are resolving imports
@@ -637,7 +669,7 @@ EXTERN_C LARGE_LOADER_API void __large_loader_link(HMODULE ImageBase, struct Lar
     DWORD OldPageProtectionFlags = 0;
     BOOL MemoryProtectSucceeded = VirtualProtect(ImportAddressTable, ImportAddressTableSize, PAGE_READWRITE, &OldPageProtectionFlags);
     if (!MemoryProtectSucceeded)
-        LogLinkErrorAndAbort("Failed to clear read-only protection status from the import address table of image %s", ImportImageFilename);
+        LogLink(LINKER_LOG_LEVEL_FATAL, "Failed to clear read-only protection status from the import address table of image %s", ImportImageFilename);
 
     // Now that we can write to the import address table, set the first entry to the placeholder address value,
     // so when we are processing cyclic dependencies, we will not attempt to link this image again when it is already on the link stack
@@ -654,15 +686,15 @@ EXTERN_C LARGE_LOADER_API void __large_loader_link(HMODULE ImageBase, struct Lar
         // Sanity check the export section header version. We cannot handle versions above our current version
         if (ExportLibraryHeader->Version > CURRENT_LARGE_LOADER_VERSION)
         {
-            LogLinkErrorAndAbort("Corrupt image: Unknown header version %d for export section header of library index %d of image %s. Maximum supported version is %d",
+            LogLink(LINKER_LOG_LEVEL_FATAL, "Corrupt image: Unknown header version %d for export section header of library index %d of image %s. Maximum supported version is %d",
                 LargeImportSectionHeader->Version, LibraryIndex, ImportImageFilename, CURRENT_LARGE_LOADER_VERSION);
         }
         // Sanity check the library filename. It must have a null terminator at the length provided, and the length must be reasonable <256
         if (ExportLibraryHeader->ImageFilenameLength >= 256 || ExportLibraryHeader->ImageFilenameLength == 0 || ExportLibraryImageFilename[ExportLibraryHeader->ImageFilenameLength] != 0)
-            LogLinkErrorAndAbort("Corrupt image: Library filename has invalid length or is not terminated correctly for library index %d of image %s", LibraryIndex, ImportImageFilename);
+            LogLink(LINKER_LOG_LEVEL_FATAL, "Corrupt image: Library filename has invalid length or is not terminated correctly for library index %d of image %s", LibraryIndex, ImportImageFilename);
 
         // Log the information about this library if necessary
-        LogLinkVerbose("- %s [version %d, hashing algo %d with %d buckets and %d exports]", ExportLibraryImageFilename,
+        LogLink(LINKER_LOG_LEVEL_LOG, "- %s [version %d, hashing algo %d with %d buckets and %d exports]", ExportLibraryImageFilename,
             ExportLibraryHeader->Version, ExportLibraryHeader->HashingAlgorithm, ExportLibraryHeader->NumExportBuckets, ExportLibraryHeader->NumExports);
 
         // If this image contains information necessary to resolve cyclic dependencies, check if it has been linked already
@@ -677,7 +709,7 @@ EXTERN_C LARGE_LOADER_API void __large_loader_link(HMODULE ImageBase, struct Lar
             // chain linked by the time we finish linking the image we are currently linking
             if (ExportLibraryImportHeader->NumImports > 0 && ExportLibraryImportAddressTable[0] == 0)
             {
-                LogLinkVerbose("Linking dependency library %s out of order because of cyclic dependencies", ExportLibraryImageFilename);
+                LogLink(LINKER_LOG_LEVEL_LOG, "Linking dependency library %s out of order because of cyclic dependencies", ExportLibraryImageFilename);
                 __large_loader_link(ExportLibraryImageBase, ExportLibraryImportHeader);
             }
         }
@@ -692,7 +724,7 @@ EXTERN_C LARGE_LOADER_API void __large_loader_link(HMODULE ImageBase, struct Lar
         // Make sure the import is null terminated and has a reasonable length
         LPCSTR ImportName = (LPCSTR) ((BYTE*) LoaderImport + LoaderImport->NameOffset);
         if (LoaderImport->NameLen >= 1024 || LoaderImport->NameLen == 0 || ImportName[LoaderImport->NameLen] != 0)
-            LogLinkErrorAndAbort("Corrupt image: Import name has invalid length or is not null terminated correctly for import index %d of image %s. NameLen: %d",
+            LogLink(LINKER_LOG_LEVEL_FATAL, "Corrupt image: Import name has invalid length or is not null terminated correctly for import index %d of image %s. NameLen: %d",
                 ImportIndex, ImportImageFilename, LoaderImport->NameLen);
 
         struct LargeLoaderImportResolutionResult ResolvedExportAddress;
@@ -705,7 +737,7 @@ EXTERN_C LARGE_LOADER_API void __large_loader_link(HMODULE ImageBase, struct Lar
             // Sanity check the import. If the export section index is invalid, chances are the image is corrupted. Do not attempt to read the import name since it will most likely not be null terminated
             if (LoaderImport->ExportSectionIndex >= LargeImportSectionHeader->NumExportSections)
             {
-                LogLinkErrorAndAbort("Corrupted image: Export section index %d out of bounds (number of export sections: %d) for import ordinal {} of image {}",
+                LogLink(LINKER_LOG_LEVEL_FATAL, "Corrupted image: Export section index %d out of bounds (number of export sections: %d) for import ordinal {} of image {}",
                    LoaderImport->ExportSectionIndex, LargeImportSectionHeader->NumExportSections, ImportIndex, ImportImageFilename);
             }
             ResolvedExportAddress = ResolveFullyQualifiedImportChecked(LargeImportSectionHeader, LoaderImport);
@@ -717,7 +749,7 @@ EXTERN_C LARGE_LOADER_API void __large_loader_link(HMODULE ImageBase, struct Lar
         }
 
         // Write the export address to the address table for this import
-        LogLinkVerbose("Linked import %s to export address %p", ImportName, ResolvedExportAddress);
+        LogLink(LINKER_LOG_LEVEL_VERBOSE, "Linked import %s to export address %p", ImportName, ResolvedExportAddress);
         ImportAddressTable[ImportIndex] = ResolvedExportAddress.MainAddress;
         if (AuxiliaryImportAddressTable)
             AuxiliaryImportAddressTable[ImportIndex] = ResolvedExportAddress.AuxiliaryAddress;
@@ -726,5 +758,5 @@ EXTERN_C LARGE_LOADER_API void __large_loader_link(HMODULE ImageBase, struct Lar
     // Restore the original flags on the import address table page to disallow writing to it
     VirtualProtect(ImportAddressTable, ImportAddressTableSize, OldPageProtectionFlags, &OldPageProtectionFlags);
 
-    LogLinkVerbose("Successfully linked image %s", ImportImageFilename);
+    LogLink(LINKER_LOG_LEVEL_LOG, "Successfully linked image %s", ImportImageFilename);
 }
