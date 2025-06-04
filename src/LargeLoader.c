@@ -30,6 +30,32 @@ static DWORD VerboseLoggingLevel = 0;
 static SRWLOCK LoadedModulesListLock;
 static struct LargeLoaderModuleEntry* LoadedModulesListHead;
 
+// Basic implementation of RtlImageNtHeaderEx without exception handling and boundary checking
+static PIMAGE_NT_HEADERS RtlImageNtHeaderEx(PVOID ImageBase)
+{
+    // Image must always start with a DOS header with DOS magic
+    const PIMAGE_DOS_HEADER DosHeader = (PIMAGE_DOS_HEADER) ImageBase;
+    if (DosHeader->e_magic != IMAGE_DOS_SIGNATURE)
+        return NULL;
+
+    // Resolve the offset to the NT image headers directory from the DOS stub at offset 0x3C
+    const INT32 NtHeaderOffset = *(PINT32) ((BYTE*) ImageBase + 0x3C);
+    const PIMAGE_NT_HEADERS NtHeader = (PIMAGE_NT_HEADERS) ((BYTE*) ImageBase + NtHeaderOffset);
+
+    // Image header must always start with PE image magic
+    if (NtHeader->Signature != IMAGE_NT_SIGNATURE)
+        return NULL;
+
+    // Optional header must always be present for images
+    if (NtHeader->FileHeader.SizeOfOptionalHeader == 0)
+        return NULL;
+
+    // Optional header magic must match our native architecture. E.g. if we're compiled for WIN64 we must have a PE32+ image, and not PE image
+    if (NtHeader->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR_MAGIC)
+        return NULL;
+    return NtHeader;
+}
+
 EXTERN_C BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason)
 {
     if (reason == DLL_PROCESS_ATTACH)
@@ -114,32 +140,6 @@ static void LogLink(DWORD VerbosityLevel, const char* MessageFormat, ...)
         }
     }
     va_end(Args);
-}
-
-// Basic implementation of RtlImageNtHeaderEx without exception handling and boundary checking
-static PIMAGE_NT_HEADERS RtlImageNtHeaderEx(PVOID ImageBase)
-{
-    // Image must always start with a DOS header with DOS magic
-    const PIMAGE_DOS_HEADER DosHeader = (PIMAGE_DOS_HEADER) ImageBase;
-    if (DosHeader->e_magic != IMAGE_DOS_SIGNATURE)
-        return NULL;
-
-    // Resolve the offset to the NT image headers directory from the DOS stub at offset 0x3C
-    const INT32 NtHeaderOffset = *(PINT32) ((BYTE*) ImageBase + 0x3C);
-    const PIMAGE_NT_HEADERS NtHeader = (PIMAGE_NT_HEADERS) ((BYTE*) ImageBase + NtHeaderOffset);
-
-    // Image header must always start with PE image magic
-    if (NtHeader->Signature != IMAGE_NT_SIGNATURE)
-        return NULL;
-
-    // Optional header must always be present for images
-    if (NtHeader->FileHeader.SizeOfOptionalHeader == 0)
-        return NULL;
-
-    // Optional header magic must match our native architecture. E.g. if we're compiled for WIN64 we must have a PE32+ image, and not PE image
-    if (NtHeader->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR_MAGIC)
-        return NULL;
-    return NtHeader;
 }
 
 // Returns the index of the export in the export table matching the import name, or -1 if the export with the matching name was not found
@@ -425,8 +425,8 @@ static struct LargeLoaderImportResolutionResult FindLargeExportForLargeImportDat
         if (AllowLogging)
         {
             // Only do this if allow logging is true since this function can be called through GetLargeProcAddress, for which we do not want to do any logging
-            //LogLinkVerbose("[Export %d Bucket %llu]: Export name is %s (kind: %d) with export hash %llu vs Import Hash %llu (kind: %d)",
-            //   GlobalExportIndex, HashBucketIndex, ExportName, LoaderExport->ImportKind, LoaderExport->ExportHash, ImportNameHash, ImportKind);
+            LogLink(LINKER_LOG_LEVEL_VERY_VERBOSE, "[Export %d Bucket %llu]: Export name is %s (kind: %d) with export hash %llu vs Import Hash %llu (kind: %d)",
+               GlobalExportIndex, HashBucketIndex, ExportName, LoaderExport->ImportKind, LoaderExport->ExportHash, ImportNameHash, ImportKind);
         }
 
         // Only consider exports that have the name hash match and the import kind matches exactly (or ImportKind is 0xFFFF, which stands for wildcard)
@@ -534,10 +534,11 @@ static struct LargeLoaderImportResolutionResult ResolveWildcardImportChecked(str
 EXTERN_C LARGE_LOADER_API FARPROC GetLargeProcAddress(const HMODULE Module, const LPCSTR ProcName)
 {
     // Resolve the address of the exports section first for the provided module
-    struct LargeLoaderExportSectionHeader* ExportSection = (struct LargeLoaderExportSectionHeader*) GetProcAddress(Module, "__large_loader_exports_base");
+    struct LargeLoaderExportSectionHeader* ExportSection = (struct LargeLoaderExportSectionHeader*) GetProcAddress(Module, "__large_loader_export_directory");
     if (ExportSection == NULL)
     {
-        return NULL;
+        // Assume this is not a Large Loader enabled module and forward the request to the dynamic linker
+        return GetProcAddress(Module, ProcName);
     }
     // Cannot retrieve exports from the export library if the unknown version. But do not assert, just return null
     if (ExportSection->Version > CURRENT_LARGE_LOADER_VERSION)
@@ -555,6 +556,67 @@ EXTERN_C LARGE_LOADER_API FARPROC GetLargeProcAddress(const HMODULE Module, cons
     return Result.MainAddress;
 }
 
+// Redirects import of GetProcAddress from Kernel32.dll to GetLargeProcAddress to make the code using GetProcAddress API compatible with Large Loader without recompilation
+static BOOL RedirectGetProcAddressToLargeInternal(const HMODULE ImageBase, const LPCSTR ImageFilename, BOOL AllowLogging)
+{
+    const PIMAGE_NT_HEADERS NtImageHeaders = RtlImageNtHeaderEx(ImageBase);
+    const IMAGE_DATA_DIRECTORY ImportDataDirEntry = NtImageHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    PIMAGE_IMPORT_DESCRIPTOR ImportDirectoryTable = (PIMAGE_IMPORT_DESCRIPTOR) ((BYTE*)ImageBase + ImportDataDirEntry.VirtualAddress);
+
+    // Iterate import directory entries until we reach the null terminator (characteristics will be 0 for it)
+    for (ULONG ImportTableIndex = 0; ImportDirectoryTable[ImportTableIndex].Characteristics != 0; ImportTableIndex++)
+    {
+        const LPCSTR ImportedDllName = (LPCSTR) ((BYTE*)ImageBase + ImportDirectoryTable[ImportTableIndex].Name);
+        if (_stricmp(ImportedDllName, "Kernel32.dll") == 0)
+        {
+            const UINT_PTR* ImportDescriptorTable = (UINT_PTR*) ((BYTE*)ImageBase + ImportDirectoryTable[ImportTableIndex].OriginalFirstThunk);
+            PVOID* BoundImportAddressTable = (PVOID*) ((BYTE*)ImageBase + ImportDirectoryTable[ImportTableIndex].FirstThunk);
+
+            // Iterate import descriptor entries until we reach the null terminator
+            for (ULONG ImportIndex = 0; ImportDescriptorTable[ImportIndex] != 0; ImportIndex++)
+            {
+                // Not interested in imports that are bound by the ordinal
+                if (!IMAGE_SNAP_BY_ORDINAL(ImportDescriptorTable[ImportIndex]))
+                {
+                    const PIMAGE_IMPORT_BY_NAME ImportedSymbolName = (PIMAGE_IMPORT_BY_NAME) ((BYTE*)ImageBase + ImportDescriptorTable[ImportIndex]);
+                    if (_stricmp(ImportedSymbolName->Name, "GetProcAddress") == 0 && BoundImportAddressTable[ImportIndex] != (PVOID) &GetLargeProcAddress)
+                    {
+                        // Remove protection from the memory page so we can write to the import address
+                        DWORD OldPageProtectionFlags = 0;
+                        const BOOL MemoryProtectSucceeded = VirtualProtect(&BoundImportAddressTable[ImportIndex], sizeof(PVOID), PAGE_READWRITE, &OldPageProtectionFlags);
+                        if (!MemoryProtectSucceeded)
+                        {
+                            // Do not crash if logging is not enabled, e.g. this has been called externally through the Large Loader API
+                            if (AllowLogging)
+                                LogLink(LINKER_LOG_LEVEL_FATAL, "Failed to clear read-only status for GetProcAddress import entry for image %s", ImageFilename);
+                            return FALSE;
+                        }
+
+                        // Update the pointer to point to our implementation that falls back to GetProcAddress if large loader is not used for module
+                        BoundImportAddressTable[ImportIndex] = (PVOID) &GetLargeProcAddress;
+                        // Logging is disabled if this function has been called externally
+                        if (AllowLogging)
+                            LogLink(LINKER_LOG_LEVEL_VERBOSE, "Redirected GetProcAddress to GetLargeProcAddress for image %s", ImageFilename);
+
+                        // Restore the protection flags to the previous value
+                        VirtualProtect(&BoundImportAddressTable[ImportIndex], sizeof(PVOID), OldPageProtectionFlags, &OldPageProtectionFlags);
+                        return TRUE;
+                    }
+                }
+            }
+        }
+    }
+    // Even if we did not find GetProcAddress in the import table, this function succeeds
+    return TRUE;
+}
+
+EXTERN_C LARGE_LOADER_API BOOL RedirectGetProcAddressToLargeLoader(HMODULE Module)
+{
+    char ModuleFilenameBuffer[4096] = {0};
+    GetModuleFileNameA(Module, ModuleFilenameBuffer, sizeof(ModuleFilenameBuffer));
+    return RedirectGetProcAddressToLargeInternal(Module, ModuleFilenameBuffer, FALSE);
+}
+
 EXTERN_C LARGE_LOADER_API void __large_loader_register(const HMODULE ImageBase, struct LargeLoaderExportSectionHeader* LargeExportSectionHeader)
 {
     const LPCSTR ExportLibraryImageFilename = (LPCSTR) ((BYTE*) LargeExportSectionHeader + LargeExportSectionHeader->ImageFilenameOffset);
@@ -566,6 +628,9 @@ EXTERN_C LARGE_LOADER_API void __large_loader_register(const HMODULE ImageBase, 
     // Sanity check the library filename. It must have a null terminator at the length provided, and the length must be reasonable <256
     if (LargeExportSectionHeader->ImageFilenameLength >= 256 || LargeExportSectionHeader->ImageFilenameLength == 0 || ExportLibraryImageFilename[LargeExportSectionHeader->ImageFilenameLength] != 0)
         LogLink(LINKER_LOG_LEVEL_FATAL, "Corrupt image: Library filename has invalid length or is not terminated correctly for library at %p", ImageBase);
+
+    // Redirect GetLargeProcAddress for the image to our implementation that can handle large exports
+    RedirectGetProcAddressToLargeInternal(ImageBase, ExportLibraryImageFilename, TRUE);
 
     // Create a new module list entry for this module
     struct LargeLoaderModuleEntry* NewModuleEntry = malloc(sizeof(struct LargeLoaderModuleEntry));
@@ -589,10 +654,6 @@ EXTERN_C LARGE_LOADER_API void __large_loader_register(const HMODULE ImageBase, 
     // Notify that we have loaded a new library
     LogLink(LINKER_LOG_LEVEL_LOG, "Registered large library %s in the loaded module list lookup", ExportLibraryImageFilename);
 }
-
-#ifdef _M_X64
-
-#endif
 
 EXTERN_C LARGE_LOADER_API void __large_loader_unregister(HMODULE ImageBase)
 {
@@ -637,10 +698,13 @@ EXTERN_C LARGE_LOADER_API void __large_loader_link(HMODULE ImageBase, struct Lar
     struct LargeLoaderExportSectionHeader*** ImportedExportSections = (struct LargeLoaderExportSectionHeader***) ((BYTE*) LargeImportSectionHeader + LargeImportSectionHeader->ImportedExportSectionsOffset);
     BYTE* ImportTable = (BYTE*) LargeImportSectionHeader + LargeImportSectionHeader->ImportTableOffset;
 
+    // Redirect GetLargeProcAddress for the image to our implementation that can handle large exports
+    RedirectGetProcAddressToLargeInternal(ImageBase, ImportImageFilename, TRUE);
+
     // Skip linking images that have zero imports. In such cases the linker should not generate the large imports section at all
     if (LargeImportSectionHeader->NumImports == 0)
     {
-        LogLink(LINKER_LOG_LEVEL_LOG, "Skipping linking image %s because it has no imports", ImportImageFilename);
+        LogLink(LINKER_LOG_LEVEL_VERBOSE, "Skipping linking image %s because it has no imports", ImportImageFilename);
         return;
     }
     // If first entry in the address table is not zero, we have already linked this image, or are presently in the process of linking it (in case of circular dependencies)
@@ -649,9 +713,9 @@ EXTERN_C LARGE_LOADER_API void __large_loader_link(HMODULE ImageBase, struct Lar
         // If first import is set to the placeholder address value, we are in the process of linking images with cyclic dependencies,
         // and this image is already on the link stack and as such will be linked later
         if (ImportAddressTable[0] == LINKER_PLACEHOLDER_ADDRESS_VALUE)
-            LogLink(LINKER_LOG_LEVEL_LOG, "Discarding image %s link request because it is already on the cyclic dependency resolution stack", ImportImageFilename);
+            LogLink(LINKER_LOG_LEVEL_VERBOSE, "Discarding image %s link request because it is already on the cyclic dependency resolution stack", ImportImageFilename);
         else
-            LogLink(LINKER_LOG_LEVEL_LOG, "Discarding image %s link request because it has already been linked", ImportImageFilename);
+            LogLink(LINKER_LOG_LEVEL_VERBOSE, "Discarding image %s link request because it has already been linked", ImportImageFilename);
         return;
     }
 
@@ -661,7 +725,7 @@ EXTERN_C LARGE_LOADER_API void __large_loader_link(HMODULE ImageBase, struct Lar
         AuxiliaryImportAddressTable = (LPVOID*) ((BYTE*) LargeImportSectionHeader + LargeImportSectionHeader->AuxiliaryAddressTableOffset);
 
     // Log additional information about the library being linked
-    LogLink(LINKER_LOG_LEVEL_LOG, "Linking image %s version %d with %d imports from %d shared libraries: ",
+    LogLink(LINKER_LOG_LEVEL_LOG, "Linking image %s version %d with %d imports from %d shared libraries",
         ImportImageFilename, LargeImportSectionHeader->Version, LargeImportSectionHeader->NumImports, LargeImportSectionHeader->NumExportSections);
 
     // Allow writing to the import address table while we are resolving imports
@@ -694,7 +758,7 @@ EXTERN_C LARGE_LOADER_API void __large_loader_link(HMODULE ImageBase, struct Lar
             LogLink(LINKER_LOG_LEVEL_FATAL, "Corrupt image: Library filename has invalid length or is not terminated correctly for library index %d of image %s", LibraryIndex, ImportImageFilename);
 
         // Log the information about this library if necessary
-        LogLink(LINKER_LOG_LEVEL_LOG, "- %s [version %d, hashing algo %d with %d buckets and %d exports]", ExportLibraryImageFilename,
+        LogLink(LINKER_LOG_LEVEL_VERBOSE, "- %s [version %d, hashing algo %d with %d buckets and %d exports]", ExportLibraryImageFilename,
             ExportLibraryHeader->Version, ExportLibraryHeader->HashingAlgorithm, ExportLibraryHeader->NumExportBuckets, ExportLibraryHeader->NumExports);
 
         // If this image contains information necessary to resolve cyclic dependencies, check if it has been linked already

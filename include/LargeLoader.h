@@ -42,3 +42,13 @@
  * @return the address of the procedure or the data member, or nullptr if it cannot be found.
  */
 EXTERN_C LARGE_LOADER_API FARPROC GetLargeProcAddress(HMODULE Module, LPCSTR ProcName);
+
+/**
+ * Scans the import directory table for the provided module and replaces GetProcAddress pointer with the pointer
+ * to GetLargeProcAddress implementation. That allows modules that need to dynamically investigate exports of other modules
+ * but that are not aware of Large Loader to successfully resolve exports in Large Loader-enabled modules
+ *
+ * @param Module the module for which GetProcAddress calls should be redirected to GetLargeProcAddress
+ * @return true if GetProcAddress has been replaced for the module, or the module does not import GetProcAddress from Kernel32.dll
+ */
+EXTERN_C LARGE_LOADER_API BOOL RedirectGetProcAddressToLargeLoader(HMODULE Module);
