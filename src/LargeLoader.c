@@ -29,6 +29,7 @@ struct LargeLoaderImportResolutionResult
 static DWORD VerboseLoggingLevel = 0;
 static SRWLOCK LoadedModulesListLock;
 static struct LargeLoaderModuleEntry* LoadedModulesListHead;
+static struct LargeLoaderExportSectionHeader* ExecutableExportSectionHeader = NULL;
 
 // Basic implementation of RtlImageNtHeaderEx without exception handling and boundary checking
 static PIMAGE_NT_HEADERS RtlImageNtHeaderEx(PVOID ImageBase)
@@ -80,6 +81,12 @@ EXTERN_C BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason)
         // Initialize the loaded modules lock
         InitializeSRWLock(&LoadedModulesListLock);
         LoadedModulesListHead = NULL;
+
+        // Cache the large loader export section header for the executable file that spawned this process
+        // Main executable might not actually be compiled with large exports enabled, so this can be null in some cases
+        const HMODULE ProcessExecutableImageBase = GetModuleHandleA(NULL);
+        ExecutableExportSectionHeader = (struct LargeLoaderExportSectionHeader*) GetProcAddress(ProcessExecutableImageBase,
+            "__large_loader_export_directory");
     }
     return TRUE;
 }
@@ -470,7 +477,8 @@ static struct LargeLoaderImportResolutionResult ResolveFullyQualifiedImportCheck
     const LPCSTR ImportName = (LPCSTR) ((BYTE*) LoaderImport + LoaderImport->NameOffset);
 
     // Resolve the export section to which this import maps
-    struct LargeLoaderExportSectionHeader* LibraryExportSectionHeader = *ImportedExportSections[LoaderImport->ExportSectionIndex];
+    struct LargeLoaderExportSectionHeader** ExportLibraryHeaderSlotPtr = ImportedExportSections[LoaderImport->ExportSectionIndex];
+    struct LargeLoaderExportSectionHeader* LibraryExportSectionHeader = ExportLibraryHeaderSlotPtr ? *ExportLibraryHeaderSlotPtr : ExecutableExportSectionHeader;
     const LPCSTR ExportLibraryImageFilename = (LPCSTR) ((BYTE*) LibraryExportSectionHeader + LibraryExportSectionHeader->ImageFilenameOffset);
 
     // Resolve the export address now
@@ -743,7 +751,18 @@ EXTERN_C LARGE_LOADER_API void __large_loader_link(HMODULE ImageBase, struct Lar
     // this might also cause the dependency images to be linked immediately without waiting for their normal DllMain execution
     for (DWORD LibraryIndex = 0; LibraryIndex < LargeImportSectionHeader->NumExportSections; LibraryIndex++)
     {
-        struct LargeLoaderExportSectionHeader* ExportLibraryHeader = *ImportedExportSections[LibraryIndex];
+        // Header slot pointer can be null to indicate that the symbols should come from the main executable of the process without naming it
+        // This is useful for creating shared objects that can be linked against a variety of different executables (like LLVM plugins or UE modules)
+        struct LargeLoaderExportSectionHeader** ExportLibraryHeaderSlotPtr = ImportedExportSections[LibraryIndex];
+        struct LargeLoaderExportSectionHeader* ExportLibraryHeader = ExportLibraryHeaderSlotPtr ? *ExportLibraryHeaderSlotPtr : ExecutableExportSectionHeader;
+
+        // Validate that the provided export library header is actually valid. While windows runtime linker will usually ensure that is the case,
+        // when we are emitting a reference to the main executable, and main executable is not a large loader linked executable, this can happen, and we need to handle this case
+        if (ExportLibraryHeader == NULL)
+        {
+            LogLink(LINKER_LOG_LEVEL_FATAL, "Cannot link shared library %s against process executable because it has not been linked with Large Loader",
+                ImportImageFilename );
+        }
         const HMODULE ExportLibraryImageBase = (HMODULE) ((BYTE*) ExportLibraryHeader - ExportLibraryHeader->SectionHeaderRVA);
         const LPCSTR ExportLibraryImageFilename = (LPCSTR) ((BYTE*) ExportLibraryHeader + ExportLibraryHeader->ImageFilenameOffset);
 
