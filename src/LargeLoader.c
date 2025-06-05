@@ -777,7 +777,7 @@ EXTERN_C LARGE_LOADER_API void __large_loader_link(HMODULE ImageBase, struct Lar
             LogLink(LINKER_LOG_LEVEL_FATAL, "Corrupt image: Library filename has invalid length or is not terminated correctly for library index %d of image %s", LibraryIndex, ImportImageFilename);
 
         // Log the information about this library if necessary
-        LogLink(LINKER_LOG_LEVEL_VERBOSE, "- %s [version %d, hashing algo %d with %d buckets and %d exports]", ExportLibraryImageFilename,
+        LogLink(LINKER_LOG_LEVEL_LOG, "- %s [version %d, hashing algo %d with %d buckets and %d exports]", ExportLibraryImageFilename,
             ExportLibraryHeader->Version, ExportLibraryHeader->HashingAlgorithm, ExportLibraryHeader->NumExportBuckets, ExportLibraryHeader->NumExports);
 
         // If this image contains information necessary to resolve cyclic dependencies, check if it has been linked already
